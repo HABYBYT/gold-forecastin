@@ -1,0 +1,530 @@
+# -*- coding: utf-8 -*-
+"""Gold Forecasting - ARIMA vs SARIMAX vs LSTM (2020-2025)
+Application du lissage exponentiel sur la période COVID-19 uniquement (analyse exploratoire)
+Auteur: HABYBY TAMIM
+Date: Février 2026
+"""
+
+# ==================== 1. INSTALLATION DES PACKAGES ====================
+!pip install -q pandas numpy matplotlib seaborn statsmodels pmdarima scikit-learn tensorflow keras arch yfinance
+
+# ==================== 2. IMPORTATIONS ====================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+from datetime import datetime, timedelta
+from scipy import stats
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
+
+# Modèles statistiques
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.holtwinters import SimpleExpSmoothing, ExponentialSmoothing
+from statsmodels.tsa.seasonal import seasonal_decompose
+from pmdarima import auto_arima
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.graphics.gofplots import qqplot
+
+# LSTM
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+
+# Test de Diebold-Mariano
+from statsmodels.tsa.stattools import acf
+
+print("✅ Bibliothèques importées")
+print(f"TensorFlow version: {tf.__version__}")
+
+# ==================== 3. CHARGEMENT ROBUSTE DU FICHIER CSV ====================
+from google.colab import files
+import io
+import re
+
+print("\n" + "="*80)
+print("ÉTAPE 1 : CHARGEMENT DES DONNÉES")
+print("="*80)
+
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+
+# Nettoyage de l'en-tête (format spécial avec guillemets)
+raw_text = io.BytesIO(uploaded[filename]).read().decode('utf-8')
+lines = raw_text.strip().splitlines()
+header = lines[0]
+header_clean = re.sub(r'"{2,}', '"', header)
+header_clean = re.sub(r'^"|"$', '', header_clean)
+header_clean = header_clean.replace('"', '')
+lines[0] = header_clean
+clean_text = '\n'.join(lines)
+
+df_raw = pd.read_csv(io.StringIO(clean_text))
+print("✅ En-tête nettoyé :", df_raw.columns.tolist())
+print(df_raw.head())
+
+# Détection colonne date
+date_col = None
+for col in ['date', 'Date', 'DATE']:
+    if col in df_raw.columns:
+        date_col = col
+        break
+if date_col is None:
+    date_col = input("Nom de la colonne de date : ")
+df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors='coerce')
+df_raw = df_raw.dropna(subset=[date_col])
+df = df_raw.set_index(date_col).sort_index()
+
+# Détection colonne or
+gold_col = None
+for col in ['Gold', 'gold', 'GOLD', 'Close', 'close']:
+    if col in df.columns:
+        gold_col = col
+        break
+if gold_col is None:
+    gold_col = df.select_dtypes(include=[np.number]).columns[0]
+df[gold_col] = pd.to_numeric(df[gold_col], errors='coerce')
+df = df.dropna(subset=[gold_col])
+
+# Renommer pour homogénéité
+df.rename(columns={gold_col: 'Gold'}, inplace=True)
+print(f"✅ Série Gold : {len(df)} observations")
+
+# ==================== 4. PÉRIODE D'ÉTUDE ====================
+START_DATE = '2020-01-01'
+END_DATE   = '2024-12-31'          # entraînement
+TEST_START = '2025-01-01'
+TEST_END   = '2025-03-31'          # test out-of-sample
+
+df = df[(df.index >= START_DATE) & (df.index <= TEST_END)]
+print(f"Période totale : {df.index.min().date()} → {df.index.max().date()}")
+
+# Variables exogènes
+exog_list = ['DXY', 'VIX', 'TNX', 'SPX', 'Oil']
+for col in exog_list:
+    if col not in df.columns:
+        print(f"⚠️ Colonne {col} manquante, remplacement par NaN")
+        df[col] = np.nan
+
+# Séparer target et exog
+target = df['Gold']
+exog = df[exog_list].copy()
+
+# ==================== 5. DÉPÔT GITHUB - FOURNISSEZ L'URL DE VOTRE RÉPERTOIRE ====================
+print("\n" + "="*80)
+print("ÉTAPE 2 : DÉPÔT GITHUB - FOURNISSEZ L'URL DE VOTRE RÉPERTOIRE")
+print("="*80)
+print("Vous pouvez soit uploader un fichier texte contenant l'URL, soit la saisir manuellement.\n")
+
+repo_url = None
+
+# Option 1: Upload d'un fichier texte
+upload_repo = files.upload()
+if upload_repo:
+    repo_filename = list(upload_repo.keys())[0]
+    repo_url = io.BytesIO(upload_repo[repo_filename]).read().decode('utf-8').strip()
+    print(f"✅ URL chargée depuis le fichier : {repo_url}")
+else:
+    # Option 2: Saisie manuelle
+    repo_url = input("Entrez l'URL de votre dépôt GitHub (ou laissez vide pour utiliser le placeholder) : ").strip()
+    if not repo_url:
+        repo_url = "https://github.com/yourusername/gold-forecastin"
+        print(f"⚠️ URL non fournie, utilisation du placeholder : {repo_url}")
+
+print(f"🔗 URL du dépôt enregistrée : {repo_url}")
+
+# Sauvegarder l'URL dans un fichier pour utilisation ultérieure
+with open('github_repo_url.txt', 'w') as f:
+    f.write(repo_url)
+
+# ==================== 6. ANALYSE EXPLORATOIRE - FOCUS COVID-19 AVEC LISSAGE EXPONENTIEL ====================
+print("\n" + "="*80)
+print("ÉTAPE 3 : ANALYSE EXPLORATOIRE - PÉRIODE COVID-19 ET LISSAGE EXPONENTIEL")
+print("="*80)
+
+# Définir la période COVID-19 (mars 2020 - décembre 2021)
+covid_start = '2020-03-01'
+covid_end   = '2021-12-31'
+
+fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+# Série complète avec highlight COVID
+axes[0].plot(target.index, target, color='steelblue', linewidth=1)
+axes[0].axvspan(pd.to_datetime(covid_start), pd.to_datetime(covid_end),
+                alpha=0.2, color='red', label='Période COVID-19')
+axes[0].set_title('Prix de l\'or (USD) - Daily avec période COVID-19')
+axes[0].set_ylabel('Prix (USD)')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# Zoom sur la période COVID-19 + lissage exponentiel
+covid_mask = (target.index >= covid_start) & (target.index <= covid_end)
+gold_covid = target[covid_mask].copy()
+
+# Lissage exponentiel simple (SES)
+ses_model = SimpleExpSmoothing(gold_covid).fit()
+gold_covid_ses = ses_model.fittedvalues
+
+# Lissage exponentiel double de Holt (tendance)
+holt_model = ExponentialSmoothing(gold_covid, trend='add', seasonal=None).fit()
+gold_covid_holt = holt_model.fittedvalues
+
+axes[1].plot(gold_covid.index, gold_covid, label='Prix réel', color='black', alpha=0.7)
+axes[1].plot(gold_covid_ses.index, gold_covid_ses, label='Lissage exponentiel simple (SES)', linestyle='--', color='blue')
+axes[1].plot(gold_covid_holt.index, gold_covid_holt, label='Lissage de Holt (tendance)', linestyle='--', color='red')
+axes[1].set_title('Zoom COVID-19 : application du lissage exponentiel')
+axes[1].set_ylabel('Prix (USD)')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('fig1_covid_smoothing.png', dpi=150)
+plt.show()
+
+print(f"✅ Lissage exponentiel appliqué sur la période COVID-19 ({len(gold_covid)} observations).")
+print(f"   Paramètre α (SES) : {ses_model.params['smoothing_level']:.3f}")
+if hasattr(holt_model, 'params'):
+    print(f"   Paramètres Holt : α={holt_model.params['smoothing_level']:.3f}, β={holt_model.params['smoothing_trend']:.3f}")
+
+# ==================== 7. GRAPHIQUES DES SÉRIES EXOGÈNES ====================
+fig, axes = plt.subplots(len(exog_list)+1, 1, figsize=(14, 14))
+axes[0].plot(target.index, target, color='gold', linewidth=1)
+axes[0].set_title('Gold Price (USD) - Daily')
+axes[0].grid(True, alpha=0.3)
+
+for i, col in enumerate(exog_list):
+    axes[i+1].plot(df.index, df[col], linewidth=0.8)
+    axes[i+1].set_title(col)
+    axes[i+1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('fig2_timeseries_all.png', dpi=150)
+plt.show()
+
+# ==================== 8. MATRICE DE CORRÉLATION ====================
+plt.figure(figsize=(10,8))
+corr = df[['Gold'] + exog_list].corr()
+sns.heatmap(corr, annot=True, cmap='RdBu_r', center=0, fmt='.2f', square=True)
+plt.title('Matrice de Corrélation')
+plt.tight_layout()
+plt.savefig('fig3_correlation.png', dpi=150)
+plt.show()
+
+# ==================== 9. TESTS DE STATIONNARITÉ ====================
+def stationarity_test(series, name):
+    adf = adfuller(series.dropna(), autolag='AIC')
+    kpss_test = kpss(series.dropna(), regression='c', nlags='auto')
+    print(f"\n{name}:")
+    print(f"  ADF: stat={adf[0]:.4f}, p-value={adf[1]:.4f} -> {'stationnaire' if adf[1]<0.05 else 'non stationnaire'}")
+    print(f"  KPSS: stat={kpss_test[0]:.4f}, p-value={kpss_test[1]:.4f} -> {'stationnaire' if kpss_test[1]>0.05 else 'non stationnaire'}")
+
+stationarity_test(target, 'Gold Price (Levels)')
+returns = target.pct_change().dropna()
+stationarity_test(returns, 'Gold Returns')
+
+# ==================== 10. DIVISION TRAIN / TEST ====================
+train_target = target[target.index < TEST_START]
+test_target = target[target.index >= TEST_START]
+
+train_exog = exog[exog.index < TEST_START]
+test_exog = exog[exog.index >= TEST_START]
+
+print(f"\n📊 Train: {train_target.index.min().date()} → {train_target.index.max().date()} ({len(train_target)} obs)")
+print(f"🔮 Test : {test_target.index.min().date()} → {test_target.index.max().date()} ({len(test_target)} obs)")
+
+# Normalisation des exogènes
+scaler_exog = StandardScaler()
+train_exog_scaled = pd.DataFrame(scaler_exog.fit_transform(train_exog),
+                                 index=train_exog.index, columns=exog_list)
+test_exog_scaled = pd.DataFrame(scaler_exog.transform(test_exog),
+                                index=test_exog.index, columns=exog_list)
+
+# ==================== 11. MODÈLE ARIMA ====================
+print("\n" + "="*80)
+print("ÉTAPE 4 : MODÈLE ARIMA")
+print("="*80)
+
+auto_arima_model = auto_arima(train_target, seasonal=False, trace=True,
+                              error_action='ignore', suppress_warnings=True,
+                              stepwise=True, information_criterion='aic',
+                              test='adf', max_p=5, max_q=5, max_d=2)
+
+best_order = auto_arima_model.order
+print(f"\n✅ Meilleur ARIMA{best_order}")
+
+arima_model = ARIMA(train_target, order=best_order)
+arima_fit = arima_model.fit()
+print(arima_fit.summary())
+
+arima_forecast = arima_fit.forecast(steps=len(test_target))
+arima_residuals = test_target.values - arima_forecast.values
+
+# ==================== 12. MODÈLE SARIMAX ====================
+print("\n" + "="*80)
+print("ÉTAPE 5 : MODÈLE SARIMAX")
+print("="*80)
+
+auto_sarimax = auto_arima(train_target, exogenous=train_exog_scaled,
+                          seasonal=False, trace=True,
+                          error_action='ignore', suppress_warnings=True,
+                          stepwise=True, information_criterion='aic',
+                          test='adf', max_p=3, max_q=3, max_d=2)
+
+best_sarimax_order = auto_sarimax.order
+print(f"\n✅ Meilleur SARIMAX{best_sarimax_order}")
+
+sarimax_model = SARIMAX(train_target, exog=train_exog_scaled,
+                        order=best_sarimax_order)
+sarimax_fit = sarimax_model.fit(disp=False)
+print(sarimax_fit.summary())
+
+sarimax_forecast = sarimax_fit.forecast(steps=len(test_target), exog=test_exog_scaled)
+sarimax_residuals = test_target.values - sarimax_forecast.values
+
+# Coefficients des exogènes
+coef_df = pd.DataFrame({
+    'Variable': ['Intercept'] + exog_list,
+    'Coefficient': sarimax_fit.params[:len(exog_list)+1],
+    'Std Error': sarimax_fit.bse[:len(exog_list)+1],
+    'P-value': sarimax_fit.pvalues[:len(exog_list)+1]
+})
+print("\n📋 Coefficients SARIMAX :")
+print(coef_df.to_string(index=False))
+
+# ==================== 13. MODÈLE LSTM ====================
+print("\n" + "="*80)
+print("ÉTAPE 6 : MODÈLE LSTM")
+print("="*80)
+
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data)-seq_length):
+        X.append(data[i:i+seq_length])
+        y.append(data[i+seq_length])
+    return np.array(X), np.array(y)
+
+SEQ_LEN = 30
+EPOCHS = 100
+BATCH_SIZE = 32
+
+scaler_y = MinMaxScaler()
+train_scaled = scaler_y.fit_transform(train_target.values.reshape(-1,1)).flatten()
+test_scaled = scaler_y.transform(test_target.values.reshape(-1,1)).flatten()
+
+X_train, y_train = create_sequences(train_scaled, SEQ_LEN)
+X_test, y_test = create_sequences(test_scaled, SEQ_LEN)
+
+X_train = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
+X_test  = X_test.reshape((X_test.shape[0], X_test.shape[1], 1))
+
+model = Sequential([
+    Input(shape=(SEQ_LEN, 1)),
+    LSTM(100, return_sequences=True),
+    Dropout(0.2),
+    LSTM(80, return_sequences=True),
+    Dropout(0.2),
+    LSTM(60, return_sequences=False),
+    Dropout(0.2),
+    Dense(25, activation='relu'),
+    Dense(1)
+])
+
+model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=0.00001)
+]
+
+history = model.fit(X_train, y_train,
+                    epochs=EPOCHS,
+                    batch_size=BATCH_SIZE,
+                    validation_split=0.2,
+                    callbacks=callbacks,
+                    verbose=1)
+
+lstm_pred_scaled = model.predict(X_test, verbose=0).flatten()
+lstm_forecast = scaler_y.inverse_transform(lstm_pred_scaled.reshape(-1,1)).flatten()
+lstm_forecast_series = pd.Series(lstm_forecast, index=test_target.index[SEQ_LEN:])
+lstm_residuals = test_target[lstm_forecast_series.index] - lstm_forecast_series
+
+# Courbes d'apprentissage
+plt.figure(figsize=(12,4))
+plt.subplot(1,2,1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('LSTM - Loss')
+plt.xlabel('Epoch')
+plt.ylabel('MSE')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('fig7_lstm_training.png', dpi=150)
+plt.show()
+
+# ==================== 14. ÉVALUATION DES PERFORMANCES ====================
+print("\n" + "="*80)
+print("ÉTAPE 7 : ÉVALUATION OUT-OF-SAMPLE")
+print("="*80)
+
+def compute_metrics(y_true, y_pred, name):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = mean_absolute_percentage_error(y_true, y_pred) * 100
+    r2 = r2_score(y_true, y_pred)
+    return {'Model': name, 'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'MAPE(%)': mape, 'R²': r2}
+
+results = []
+results.append(compute_metrics(test_target, arima_forecast, 'ARIMA'))
+results.append(compute_metrics(test_target, sarimax_forecast, 'SARIMAX'))
+
+# Aligner LSTM sur mêmes dates
+common_idx = test_target.index.intersection(lstm_forecast_series.index)
+results.append(compute_metrics(test_target.loc[common_idx],
+                               lstm_forecast_series.loc[common_idx], 'LSTM'))
+
+perf_df = pd.DataFrame(results).set_index('Model')
+print("\n📊 TABLE 2 - Performances Out-of-Sample")
+print(perf_df.round(4).to_string())
+
+best_model_mape = perf_df['MAPE(%)'].idxmin()
+print(f"\n🏆 Meilleur modèle (MAPE le plus bas) : {best_model_mape}")
+
+# ==================== 15. TEST DE DIEBOLD-MARIANO ====================
+def diebold_mariano(e1, e2, h=1, crit='MSE'):
+    e1 = np.array(e1)
+    e2 = np.array(e2)
+    d = e1**2 - e2**2 if crit == 'MSE' else np.abs(e1) - np.abs(e2)
+    d = d[~np.isnan(d)]
+    n = len(d)
+    if n < 2:
+        return np.nan, np.nan
+    mean_d = np.mean(d)
+    var_d = np.var(d, ddof=1)
+    dm_stat = mean_d / np.sqrt(var_d / n)
+    p_value = 2 * (1 - stats.norm.cdf(np.abs(dm_stat)))
+    return dm_stat, p_value
+
+print("\n📋 TABLE 3 - Diebold-Mariano Test (MSE criterion)")
+
+# Alignement des longueurs
+e_arima = arima_residuals
+e_sarimax = sarimax_residuals
+e_lstm = lstm_residuals.values
+
+min_len = min(len(e_arima), len(e_sarimax), len(e_lstm))
+
+dm_lstm_arima = diebold_mariano(e_lstm[:min_len], e_arima[:min_len])
+dm_lstm_sarimax = diebold_mariano(e_lstm[:min_len], e_sarimax[:min_len])
+dm_sarimax_arima = diebold_mariano(e_sarimax[:min_len], e_arima[:min_len])
+
+print(f"LSTM vs ARIMA   : DM = {dm_lstm_arima[0]:.4f}, p-value = {dm_lstm_arima[1]:.4f}")
+print(f"LSTM vs SARIMAX : DM = {dm_lstm_sarimax[0]:.4f}, p-value = {dm_lstm_sarimax[1]:.4f}")
+print(f"SARIMAX vs ARIMA: DM = {dm_sarimax_arima[0]:.4f}, p-value = {dm_sarimax_arima[1]:.4f}")
+
+# ==================== 16. VISUALISATION DES PRÉVISIONS ====================
+plt.figure(figsize=(14,6))
+plt.plot(test_target.index, test_target, label='Réel', color='black', linewidth=2)
+plt.plot(test_target.index, arima_forecast, '--', label=f'ARIMA{best_order}', linewidth=1.5)
+plt.plot(test_target.index, sarimax_forecast, '--', label=f'SARIMAX{best_sarimax_order}', linewidth=1.5)
+plt.plot(lstm_forecast_series.index, lstm_forecast_series, '--', label='LSTM', linewidth=1.5)
+plt.title('Figure 4: Comparaison des Prévisions (Période de Test)')
+plt.xlabel('Date')
+plt.ylabel('Prix de l\'Or (USD)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('fig4_forecast_comparison.png', dpi=150)
+plt.show()
+
+# ==================== 17. PRÉVISION 30 JOURS AVEC LSTM ====================
+print("\n" + "="*80)
+print("ÉTAPE 8 : PRÉVISION FUTURE (30 JOURS) AVEC LSTM")
+print("="*80)
+
+last_sequence = test_scaled[-SEQ_LEN:].reshape(1, SEQ_LEN, 1)
+future_preds = []
+
+for _ in range(30):
+    next_pred = model.predict(last_sequence, verbose=0)[0,0]
+    future_preds.append(next_pred)
+    last_sequence = np.roll(last_sequence, -1, axis=1)
+    last_sequence[0, -1, 0] = next_pred
+
+future_prices = scaler_y.inverse_transform(np.array(future_preds).reshape(-1,1)).flatten()
+future_dates = pd.date_range(start=test_target.index[-1] + timedelta(days=1), periods=30, freq='B')
+
+plt.figure(figsize=(14,5))
+plt.plot(target.index, target, label='Historique', color='blue', alpha=0.7)
+plt.plot(future_dates, future_prices, 'o-', color='red', label='Prévision LSTM 30j')
+plt.axvline(x=test_target.index[-1], color='black', linestyle='--', alpha=0.5)
+plt.title('Figure 5: Prévision 30 Jours du Prix de l\'Or (LSTM)')
+plt.xlabel('Date')
+plt.ylabel('Prix (USD)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('fig5_future_forecast.png', dpi=150)
+plt.show()
+
+print(f"📅 Dernier prix historique : {target.iloc[-1]:.2f} USD")
+print(f"🔮 Prévision pour {future_dates[-1].strftime('%d/%m/%Y')} : {future_prices[-1]:.2f} USD")
+
+# ==================== 18. CODE AVAILABILITY ====================
+print("\n" + "="*80)
+print("ÉTAPE 9 : CODE AVAILABILITY")
+print("="*80)
+
+# Recharger l'URL depuis le fichier au cas où
+with open('github_repo_url.txt', 'r') as f:
+    repo_url = f.read().strip()
+
+print(f"""
+L'intégralité du code source utilisé dans cette étude est disponible publiquement
+sur GitHub à l'adresse suivante :
+
+🔗 {repo_url}
+
+Ce dépôt contient :
+- Le script complet d'analyse et de modélisation
+- Les procédures de chargement et nettoyage des données
+- Les implémentations des modèles ARIMA, SARIMAX et LSTM
+- Les fonctions de visualisation et d'évaluation
+- Les données prétraitées (sous réserve de licence)
+- Des instructions pour reproduire l'intégralité des résultats
+
+Nous encourageons les chercheurs et praticiens à utiliser, modifier et étendre ce code
+dans le respect de la licence MIT.
+""")
+
+# ==================== 19. SAUVEGARDE DES RÉSULTATS ====================
+print("\n" + "="*80)
+print("ÉTAPE 10 : SAUVEGARDE DES RÉSULTATS")
+print("="*80)
+
+perf_df.to_csv('table2_performances.csv')
+coef_df.to_csv('table4_coefficients.csv')
+forecast_df = pd.DataFrame({'Date': future_dates, 'LSTM_30d_forecast': future_prices})
+forecast_df.to_csv('forecast_30days.csv', index=False)
+
+print("✅ Résultats sauvegardés :")
+print("   - table2_performances.csv")
+print("   - table4_coefficients.csv")
+print("   - forecast_30days.csv")
+print("   - github_repo_url.txt")
+print("   - Figures : fig1_covid_smoothing, fig2_timeseries_all, fig3_correlation,")
+print("     fig4_forecast_comparison, fig5_future_forecast, fig7_lstm_training")
+
+print("\n" + "="*80)
+print("FIN DE L'ANALYSE - RAPPORT COMPLET GÉNÉRÉ")
+print("="*80)
